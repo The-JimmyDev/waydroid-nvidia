@@ -327,10 +327,10 @@ index b718ef25..1a5c533a 100644
  
  static bool
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index c170bd32..761b7072 100644
+index c170bd32..3c122844 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
-@@ -5,10 +5,19 @@
+@@ -5,10 +5,20 @@
  
  #include "vkr_context.h"
  
@@ -339,6 +339,7 @@ index c170bd32..761b7072 100644
 +#include <sys/ioctl.h>
  #include <sys/mman.h>
  #include <sys/types.h>
++#include <time.h>
  #include <unistd.h>
  
 +/* the bundled UAPI header (src/drm/drm-uapi) — NOT <drm/drm.h>: the one-ioctl
@@ -350,7 +351,7 @@ index c170bd32..761b7072 100644
  #include "util/anon_file.h"
  #include "venus-protocol/vn_protocol_renderer_dispatches.h"
  
-@@ -136,10 +145,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
+@@ -136,10 +146,11 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
  }
  
  bool
@@ -366,7 +367,7 @@ index c170bd32..761b7072 100644
  {
     /* retire fence on cpu timeline directly */
     if (ring_idx == 0) {
-@@ -155,11 +165,328 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+@@ -155,11 +166,367 @@ vkr_context_submit_fence(struct vkr_context *ctx,
     /* always merge fences */
     assert(!(flags & ~VIRGL_RENDERER_FENCE_FLAG_MERGEABLE));
     flags = VIRGL_RENDERER_FENCE_FLAG_MERGEABLE;
@@ -664,14 +665,53 @@ index c170bd32..761b7072 100644
 +                                     uint64_t semaphore_id,
 +                                     int sync_file_fd)
 +{
-+   struct vkr_device *dev = vkr_context_get_object(ctx, device_id);
-+   struct vkr_semaphore *sem = vkr_context_get_object(ctx, semaphore_id);
-+   if (!dev || dev->base.type != VK_OBJECT_TYPE_DEVICE || !sem ||
-+       sem->base.type != VK_OBJECT_TYPE_SEMAPHORE) {
-+      vkr_log("import_semaphore: bad object ids dev %" PRIu64 " sem %" PRIu64,
-+              device_id, semaphore_id);
-+      close(sync_file_fd);
-+      return -EINVAL;
++   /* VCMD_SEMAPHORE_IMPORT_SYNC_FD is a direct, synchronous vtest command:
++    * the moment its bytes are off the wire, this does an immediate object-
++    * table lookup. But the device/semaphore it names were (almost always)
++    * created by an EARLIER venus command the same guest thread already
++    * submitted -- and venus command buffers are dispatched asynchronously
++    * off a shared ring (vn_ring_submit_locked() et al.), not synchronously
++    * with the wire write that queued them. So a guest that creates a
++    * semaphore and immediately imports a fence into it can win this command
++    * ahead of the ring's own dispatcher actually creating the object,
++    * purely from these two paths running at different speeds -- confirmed
++    * live under sustained load (TikTok's video feed): "import_semaphore:
++    * bad object ids" firing on essentially every attempt, with monotonically
++    * increasing object ids, i.e. the ring never got the chance to catch up
++    * before we gave up on it.
++    *
++    * This is a genuine, short-lived race, not a real missing object: the
++    * object will exist within microseconds to low milliseconds once the
++    * ring dispatcher gets to it. Retry a few times with a short backoff
++    * before concluding the id is actually bad. Each render_server worker
++    * process (render-server-worker=process, what this project actually
++    * builds with) owns exactly one context, so blocking this thread briefly
++    * costs nothing globally -- it only delays this one fence import, and
++    * only for as long as it genuinely takes the ring to catch up. */
++   struct vkr_device *dev = NULL;
++   struct vkr_semaphore *sem = NULL;
++   /* total ~25.5ms worst case -- comfortably above what a ring dispatch
++    * delay should ever look like under real load, but still bounded */
++   static const long retry_delays_ns[] = { 100000L,  200000L,  400000L,
++                                           800000L,  1600000L, 3200000L,
++                                           6400000L, 6400000L, 6400000L };
++   long waited_ns = 0;
++   for (unsigned attempt = 0;; attempt++) {
++      dev = vkr_context_get_object(ctx, device_id);
++      sem = vkr_context_get_object(ctx, semaphore_id);
++      if (dev && dev->base.type == VK_OBJECT_TYPE_DEVICE && sem &&
++          sem->base.type == VK_OBJECT_TYPE_SEMAPHORE)
++         break;
++      if (attempt >= ARRAY_SIZE(retry_delays_ns)) {
++         vkr_log("import_semaphore: bad object ids dev %" PRIu64 " sem %" PRIu64
++                 " (gave up after %u retries, ~%.1fms)",
++                 device_id, semaphore_id, attempt, waited_ns / 1e6);
++         close(sync_file_fd);
++         return -EINVAL;
++      }
++      struct timespec ts = { .tv_sec = 0, .tv_nsec = retry_delays_ns[attempt] };
++      nanosleep(&ts, NULL);
++      waited_ns += retry_delays_ns[attempt];
 +   }
 +
 +   const VkImportSemaphoreFdInfoKHR info = {
@@ -696,7 +736,7 @@ index c170bd32..761b7072 100644
  int
  vkr_context_export_fence(struct vkr_context *ctx,
                           uint32_t ring_idx,
-@@ -644,6 +971,25 @@ vkr_context_destroy(struct vkr_context *ctx)
+@@ -644,6 +1011,25 @@ vkr_context_destroy(struct vkr_context *ctx)
  
     vkr_context_wait_ring_fini(ctx);
  
@@ -722,7 +762,7 @@ index c170bd32..761b7072 100644
     if (ctx->ring_monitor.started)
        vkr_context_ring_monitor_fini(ctx);
  
-@@ -727,6 +1073,11 @@ vkr_context_create(uint32_t ctx_id,
+@@ -727,6 +1113,11 @@ vkr_context_create(uint32_t ctx_id,
     if (!vkr_context_wait_ring_init(ctx))
        goto err_ctx_wait_ring_init;
  
