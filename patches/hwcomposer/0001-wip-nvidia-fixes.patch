@@ -1,5 +1,5 @@
 diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
-index a86b9aa..940c89b 100644
+index a86b9aa..060c8d4 100644
 --- a/hwcomposer/gralloc_handler.cpp
 +++ b/hwcomposer/gralloc_handler.cpp
 @@ -25,6 +25,7 @@
@@ -10,13 +10,39 @@ index a86b9aa..940c89b 100644
  #include <cstdint>
  #include <memory>
  
-@@ -162,6 +163,32 @@ namespace {
+@@ -162,6 +163,58 @@ namespace {
          return fmt;
      }
  }
 +namespace {
 +bool compositor_supports(display *display, uint32_t drm_format, uint64_t modifier) {
 +    if (modifier == DRM_FORMAT_MOD_INVALID)
++        return false;
++    /* NVIDIA's zwp_linux_dmabuf_v1 advertisement lists DRM_FORMAT_MOD_LINEAR
++     * as generically supported for essentially every format (confirmed live:
++     * waydroid.modifiers.<ABGR8888>.* includes modifier 0), but its EGL
++     * import path does not reliably honor that for dma-bufs it didn't
++     * allocate itself -- specifically the CPU-mappable/software-written
++     * buffers our vtest gralloc has to serve as plain udmabufs (ad SDKs,
++     * video overlays: usage forces MAPPABLE, which forces linear on the host
++     * side). Attaching one of these via zwp_linux_buffer_params_v1 fails with
++     * "Could not bind the given EGLImage to a CoglTexture2D" (protocol error
++     * 7), which is fatal to the whole Wayland connection -- this is issue
++     * #11 ("Waydroid UI crashing when opening certain apps and pages",
++     * reproduced with Block Craft 3D's ad overlay: 1814x471 ABGR8888 mod 0
++     * import failed while every other, tiled-modifier layer in the same
++     * frame imported fine).
++     *
++     * Every other modifier this same NVIDIA/Mutter combo advertises for
++     * these formats is one of its own block-linear tiled modifiers, which do
++     * import correctly (seen throughout the same frame). So: never trust the
++     * advertised support for LINEAR specifically. Reporting it as
++     * unsupported routes the layer through the caller's existing
++     * displayable_buffer() gate instead of a direct dmabuf attach, which
++     * makes SurfaceFlinger composite it into the framebuffer target via GLES
++     * on the next frame -- that path always produces a real tiled modifier,
++     * never linear, so it is unaffected by this restriction. */
++    if (modifier == DRM_FORMAT_MOD_LINEAR)
 +        return false;
 +    auto it = display->modifiers.find(drm_format);
 +    if (it == display->modifiers.end())
@@ -43,7 +69,7 @@ index a86b9aa..940c89b 100644
  std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_metadata& metadata,
                                                                  int prime_fd, int drm_format, int byte_stride,
                                                                  int offset, uint64_t modifier, buffer_handle_t handle)
-@@ -178,6 +205,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
+@@ -178,6 +231,15 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
      }
      assert(drm_format >= 0);
  
@@ -59,7 +85,7 @@ index a86b9aa..940c89b 100644
      zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(display->dmabuf);
      zwp_linux_buffer_params_v1_add(params, prime_fd, 0, offset, byte_stride, modifier >> 32, modifier & 0xffffffff);
      zwp_linux_buffer_params_v1_add_listener(params, &params_listener, nullptr);
-@@ -264,6 +300,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
+@@ -264,6 +326,11 @@ std::unique_ptr<buffer> create_buffer_gbm(display *display, const buffer_metadat
  }
  std::unique_ptr<buffer> create_buffer_cros(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
      auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
@@ -71,7 +97,7 @@ index a86b9aa..940c89b 100644
      return create_dmabuf_wl_buffer(display, metadata, cros_handle->fds[0], cros_handle->format, cros_handle->strides[0], cros_handle->offsets[0], cros_handle->format_modifier, handle);
  }
  std::unique_ptr<buffer> create_buffer_android(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {
-@@ -314,6 +355,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
+@@ -314,6 +381,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
  }
  
  gralloc_handler::create_buffer_func gralloc_handler::select_create_buffer_impl(display *display, GrallocType gralloc_type) {
@@ -80,7 +106,7 @@ index a86b9aa..940c89b 100644
      if (gralloc_type == GrallocType::GRALLOC_GBM && display->dmabuf) {
          return create_buffer_gbm;
      } else if (gralloc_type == GrallocType::GRALLOC_CROS && display->dmabuf) {
-@@ -333,7 +376,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
+@@ -333,7 +402,39 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
      }
  }
  
