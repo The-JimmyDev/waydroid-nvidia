@@ -140,7 +140,21 @@ echo "== nvidia-drm.modeset: Y"
 # SurfaceFlinger buffers our driver never sees -> crash loop (issue #1:
 # system and vendor images version independently, and 'upgrade -o' never
 # refreshes them — migrated installs can carry an ancient vendor).
-VIMG=/var/lib/waydroid/images/vendor.img
+#
+# images_path is NOT always /var/lib/waydroid/images: the waydroid-image
+# package (a completely ordinary way to install Waydroid, e.g. on Arch) ships
+# a preinstalled system.img/vendor.img under /usr/share/waydroid-extra/images
+# and Waydroid's own initializer switches images_path to that location
+# whenever it finds one, rather than downloading OTA images at all — an
+# install using it has nothing under /var/lib/waydroid/images at all, ever.
+# Read the real path out of waydroid.cfg instead of assuming the OTA default.
+IMAGES_PATH=$(python3 -c '
+import configparser
+cp = configparser.ConfigParser()
+cp.read("'"$CFG"'")
+print(cp.get("waydroid", "images_path", fallback="/var/lib/waydroid/images"))
+')
+VIMG="$IMAGES_PATH/vendor.img"
 [ -f "$VIMG" ] || die "$VIMG missing — run 'waydroid init' first"
 VMNT=$(mktemp -d)
 mount -o loop,ro "$VIMG" "$VMNT" || { rmdir "$VMNT"; die "cannot inspect $VIMG (mount failed)"; }
